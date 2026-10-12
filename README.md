@@ -9,9 +9,9 @@ to 20.
   Wi-Fi, is ignored.
 - **Survives network changes.** Devices are known by a cryptographic key, not
   an IP address, and find each other again on any network.
-- **Copies, not clipboard state.** Each copy is sent to the other devices and
-  lands on their clipboard as if it had been copied there, so clipboard-history
-  apps record it too.
+- **Text and images.** Each copy is sent to the other devices and lands on
+  their clipboard as if it had been copied there, so clipboard-history apps
+  record it too.
 - **Light.** One ~1.5 MB binary, a few MB of memory, ~0% CPU when idle.
   Everything is end-to-end encrypted.
 
@@ -205,8 +205,13 @@ protocol, devices that haven't updated can't connect, and both sides' logs and
   restored from another device.
 - **Copies made while clipsync isn't running** aren't sent later: at startup
   it can't tell a new copy from old clipboard contents.
-- **Text only**, up to 16 MB. Images and files aren't synced.
-- Clipboard text is never written to disk.
+- **Text and images**, up to 50 MB per copy. Images travel as PNG; on a Mac,
+  they arrive as both PNG and TIFF so any app can paste them, and images that
+  Mac apps copy as TIFF are converted. When a copy has both text and an image
+  (spreadsheet cells, for example), the text is synced. Files aren't synced.
+- Devices still on clipsync 0.1.0 keep syncing text with newer ones, but don't
+  get images.
+- Clipboard contents are never written to disk.
 
 clipsync is meant to be left running. Measured recovery times:
 
@@ -268,10 +273,12 @@ cargo test                      # unit tests, and end-to-end tests with real pro
 cargo test -- --ignored         # also the system tests (see below)
 ```
 
-The end-to-end tests in [`tests/cluster.rs`](tests/cluster.rs) start real
-clipsync processes that pair, sync, remove and restart each other. They don't
-need a display or a network: each test device uses a plain file as its
-clipboard, and mDNS is off. They run in about 10 seconds.
+The end-to-end tests in [`tests/cluster.rs`](tests/cluster.rs) and
+[`tests/images.rs`](tests/images.rs) start real clipsync processes that pair,
+sync text and images, remove and restart each other. They don't need a display
+or a network: each test device uses a plain file as its clipboard (a file
+starting with the PNG signature is an image), and mDNS is off. They run in
+about 20 seconds.
 
 The system tests in [`tests/system.rs`](tests/system.rs) exercise the real
 backends, and skip themselves if what they need is missing:
@@ -281,6 +288,7 @@ backends, and skip themselves if what they need is missing:
 | `x11_backend` | `Xvfb`, and `python3` with `tkinter` |
 | `wayland_backend` | `labwc` (run headless) and `wl-clipboard` |
 | `devices_find_each_other_with_mdns` | multicast on the local network |
+| `works_with_0_1_0` | internet access, to download the 0.1.0 release |
 
 Environment variables, mainly for testing:
 
@@ -301,12 +309,16 @@ system test on Linux.
 1. Set the new version in `Cargo.toml` (and run `cargo build` to update
    `Cargo.lock`). If devices on the new version can't talk to older ones, also
    bump `PROTOCOL` in `src/net.rs`.
-2. Commit, then tag and push:
+2. Commit and push, then release it under the tag `v` + that version, either
+   with git:
 
    ```sh
    git tag v0.2.0
    git push origin main v0.2.0
    ```
+
+   or by creating a release in GitHub's web interface with a new tag `v0.2.0`.
+   The tag must match `Cargo.toml` exactly (`v0.2.0`, not `v0.2`).
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) then builds
 static Linux binaries (x86_64, ARM64) and macOS binaries (Apple Silicon,
@@ -343,7 +355,8 @@ installer, and `clipsync update` finds the release through `releases/latest`.
   pair of devices keeps one connection: both dial, and if both connections
   succeed, both keep the one dialed by the lower device id. Pings every 5 s;
   a connection silent for 15 s is dead.
-- **Copies.** A copy is an event: (hybrid logical clock, origin device, text).
+- **Copies.** A copy is an event: (hybrid logical clock, origin device,
+  text or PNG image).
   The clock never runs backwards and always moves past anything the device has
   seen, so ordering follows cause and effect, and every device applies the same
   rule: newer than what I have, or ignore it. On connecting, devices say which

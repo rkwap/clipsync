@@ -84,6 +84,7 @@ fn x11_backend() {
     let tk = std::env::temp_dir().join(format!("clipsync-test-tk-{}.py", std::process::id()));
     fs::write(&tk, TK).unwrap();
     let ((_xa, da), (_xb, db)) = (xvfb(), xvfb());
+    let a_display = da.clone();
     let mut a = Device::with_clipboard("a", Clipboard::X11 { display: da, tk: tk.clone() });
     let mut b = Device::with_clipboard("b", Clipboard::X11 { display: db, tk: tk.clone() });
     a.start();
@@ -102,6 +103,24 @@ fn x11_backend() {
     // After the app that copied exits, b's clipsync still serves the text.
     thread::sleep(Duration::from_secs(6));
     assert_eq!(b.clipboard(), big);
+
+    // Images. No X11 app here copies images, so one comes from a device with a
+    // file clipboard. a's clipsync then serves it on a's display; to check what
+    // it serves, a second clipsync on that display, in a separate cluster,
+    // reads it and passes it on to g.
+    let mut f = Device::new("f");
+    f.start();
+    pair(&a, &f);
+    wait_connected(&[&a, &b, &f]);
+    let mut reader = Device::with_clipboard("reader", Clipboard::X11 { display: a_display.clone(), tk: tk.clone() });
+    let mut g = Device::new("g");
+    reader.start();
+    g.start();
+    pair(&reader, &g);
+    wait_connected(&[&reader, &g]);
+    let image = big_png(3 << 20); // large enough to move in chunks
+    f.copy_image(&image);
+    g.wait_for_image(&image);
     let _ = fs::remove_file(tk);
 }
 
@@ -159,6 +178,13 @@ fn wayland_backend() {
     b.wait_for_clipboard("hello from Wayland ✓");
     b.copy("multi\nline\n");
     a.wait_for_clipboard("multi\nline\n");
+    a.copy_image(PNG);
+    b.wait_for_image(PNG);
+    let big = big_png(4 << 20);
+    b.copy_image(&big);
+    a.wait_for_image(&big);
+    a.copy("text after images");
+    b.wait_for_clipboard("text after images");
     // Stopping clipsync must not leave its wl-paste helper behind.
     let pid = a.pid();
     a.stop();
@@ -190,4 +216,51 @@ fn devices_find_each_other_with_mdns() {
     wait_connected(&[&a, &b]);
     a.copy("found via mDNS");
     b.wait_for_clipboard("found via mDNS");
+}
+
+/// The release target for this machine, as the installer picks it.
+fn release_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        _ => None,
+    }
+}
+
+#[test]
+#[ignore = "downloads clipsync 0.1.0 from GitHub"]
+fn works_with_0_1_0() {
+    let Some(target) = release_target() else { return skip("no 0.1.0 build for this platform") };
+    let dir = std::env::temp_dir().join(format!("clipsync-test-old-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let url = format!("https://github.com/rkwap/clipsync/releases/download/v0.1.0/clipsync-0.1.0-{target}.tar.gz");
+    let fetched = Command::new("sh")
+        .args(["-c", &format!("curl -fsSL '{url}' | tar -xz -C '{}'", dir.display())])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !fetched {
+        return skip("couldn't download 0.1.0");
+    }
+    let mut new = Device::new("new");
+    let mut old = Device::new("old");
+    old.bin = dir.join(format!("clipsync-0.1.0-{target}/clipsync"));
+    new.start();
+    old.start();
+    pair(&new, &old);
+    wait_connected(&[&new, &old]);
+
+    new.copy("text from the new version");
+    old.wait_for_clipboard("text from the new version");
+    old.copy("text from 0.1.0");
+    new.wait_for_clipboard("text from 0.1.0");
+    // 0.1.0 doesn't know images: it ignores them and keeps syncing text.
+    new.copy_image(PNG);
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(old.clipboard(), "text from 0.1.0");
+    new.copy("text after the image");
+    old.wait_for_clipboard("text after the image");
+    assert!(new.run(&["devices"]).1.contains("runs clipsync 0.1.0; update it"));
+    let _ = fs::remove_dir_all(dir);
 }

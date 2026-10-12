@@ -1,5 +1,8 @@
-# Push a tag like v0.2.0 (matching the version in Cargo.toml) to publish a
-# release: binaries for Linux and macOS, their checksums, and install.sh.
+# Publishes a release when a tag like v0.2.0 is pushed: binaries for Linux
+# and macOS, their checksums, and install.sh. The tag must be "v" plus the
+# version in Cargo.toml. Pushing the tag with git, or creating the release in
+# GitHub's web interface (which creates the tag), both work; in the latter
+# case the files are attached to the release you created.
 
 name: Release
 
@@ -31,7 +34,7 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
+            echo "::error::The tag is $GITHUB_REF_NAME, but Cargo.toml says version $version. Release it as v$version (or change the version in Cargo.toml first)."
             exit 1
           fi
       - name: Build
@@ -69,4 +72,9 @@ jobs:
           cp install.sh release/
           cd release
           sha256sum clipsync-*.tar.gz > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --title "clipsync ${GITHUB_REF_NAME#v}" --generate-notes ./*
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Created in the web interface: keep its title and notes, add the files.
+            gh release upload "$GITHUB_REF_NAME" ./* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --title "clipsync ${GITHUB_REF_NAME#v}" --generate-notes ./*
+          fi

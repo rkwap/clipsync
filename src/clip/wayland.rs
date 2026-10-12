@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::{Content, is_png};
+
 /// Whether wl-paste is installed and the compositor supports data-control.
 /// Without data-control (e.g. GNOME), `wl-paste --watch` exits right away.
 pub fn supported() -> bool {
@@ -42,10 +44,18 @@ pub fn stop() {
     }
 }
 
-pub fn set(text: &str) -> io::Result<()> {
-    let mut child = Command::new("wl-copy").stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?;
+pub fn set(content: &Content) -> io::Result<()> {
+    let mut cmd = Command::new("wl-copy");
+    let bytes: &[u8] = match content {
+        Content::Text(t) => t.as_bytes(),
+        Content::Image(png) => {
+            cmd.args(["--type", "image/png"]);
+            png
+        }
+    };
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?;
     // Dropping stdin after the write closes the pipe so wl-copy sees EOF.
-    child.stdin.take().unwrap().write_all(text.as_bytes())?;
+    child.stdin.take().unwrap().write_all(bytes)?;
     let status = child.wait()?;
     if !status.success() {
         return Err(io::Error::other(format!("wl-copy exited with {status}")));
@@ -53,25 +63,34 @@ pub fn set(text: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn get() -> Option<String> {
-    let out = Command::new("wl-paste")
-        .args(["--no-newline", "--type", "text"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None; // empty clipboard, or no text in it (e.g. an image)
-    }
-    String::from_utf8(out.stdout).ok()
+fn paste(args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("wl-paste").args(args).stderr(Stdio::null()).output().ok()?;
+    // Fails on an empty clipboard.
+    out.status.success().then_some(out.stdout)
 }
 
-pub fn watch(mut on_change: impl FnMut(String, bool)) -> io::Result<()> {
+/// The clipboard's text if it offers any, otherwise its PNG image.
+fn get() -> Option<Content> {
+    let types = String::from_utf8(paste(&["--list-types"])?).ok()?;
+    let is_text = |t: &str| t.starts_with("text/plain") || matches!(t, "UTF8_STRING" | "STRING" | "TEXT");
+    if types.lines().any(is_text) {
+        let text = String::from_utf8(paste(&["--no-newline", "--type", "text"])?).ok()?;
+        return Some(Content::Text(text.into()));
+    }
+    if types.lines().any(|t| t == "image/png") {
+        let png = paste(&["--no-newline", "--type", "image/png"]).filter(|b| is_png(b))?;
+        return Some(Content::Image(png.into()));
+    }
+    None
+}
+
+pub fn watch(mut on_change: impl FnMut(Content, bool)) -> io::Result<()> {
     let mut quick_exits = 0;
     loop {
         let started = Instant::now();
         // wl-paste also reports the current contents once at startup; that isn't a change.
         let mut startup = get();
-        on_change(startup.clone().unwrap_or_default(), true);
+        on_change(startup.clone().unwrap_or(Content::Text("".into())), true);
         // wl-paste runs `echo` on every clipboard change, giving us one line per change.
         let mut cmd = Command::new("wl-paste");
         cmd.args(["--watch", "echo"]).stdout(Stdio::piped());
@@ -93,12 +112,12 @@ pub fn watch(mut on_change: impl FnMut(String, bool)) -> io::Result<()> {
         WATCHER.store(child.id() as i32, Ordering::Relaxed);
         for line in BufReader::new(child.stdout.take().unwrap()).lines() {
             line?;
-            let text = get();
-            if startup.take().is_some_and(|s| text.as_ref() == Some(&s)) {
+            let content = get();
+            if startup.take().is_some_and(|s| content.as_ref() == Some(&s)) {
                 continue;
             }
-            if let Some(text) = text {
-                on_change(text, false);
+            if let Some(content) = content {
+                on_change(content, false);
             }
         }
         let status = child.wait()?;

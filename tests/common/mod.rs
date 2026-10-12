@@ -17,6 +17,23 @@ use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_clipsync");
 
+/// A real 4x3 PNG.
+pub const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, 0x08, 0x02, 0x00, 0x00, 0x00, 0x3b,
+    0x96, 0x39, 0x91, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x38,
+    0xa1, 0xa1, 0x01, 0x47, 0x0c, 0x38, 0x39, 0x00, 0x07, 0xa6, 0x0d, 0x21, 0x94, 0xb0, 0x13,
+    0xfc, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82
+];
+
+/// An image of about `size` bytes: a valid PNG header, padded (clipsync
+/// passes images through without decoding them).
+pub fn big_png(size: usize) -> Vec<u8> {
+    let mut png = PNG.to_vec();
+    png.extend((0..size).map(|i| (i * 7 % 251) as u8));
+    png
+}
+
 /// How the device's clipboard is reached.
 pub enum Clipboard {
     File,
@@ -29,6 +46,8 @@ pub struct Device {
     pub dir: PathBuf,
     pub port: u16,
     pub clipboard: Clipboard,
+    /// The clipsync binary to run (another version, for compatibility tests).
+    pub bin: PathBuf,
     /// Use mDNS (off by default, so tests work without multicast).
     pub discovery: bool,
     daemon: Option<Child>,
@@ -59,12 +78,12 @@ impl Device {
         let dir = std::env::temp_dir().join(format!("clipsync-test-{}-{n}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        Device { name: name.into(), dir, port: free_port(), clipboard, discovery: false, daemon: None }
+        Device { name: name.into(), dir, port: free_port(), clipboard, bin: BIN.into(), discovery: false, daemon: None }
     }
 
     /// A clipsync command run as this device.
     pub fn cmd(&self) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(&self.bin);
         c.env("CLIPSYNC_DIR", self.dir.join("config")).env("CLIPSYNC_NAME", &self.name);
         c.env("CLIPSYNC_NO_UPDATE_CHECK", "1");
         c.env_remove("CLIPSYNC_CLIPBOARD_FILE").env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY");
@@ -164,6 +183,51 @@ impl Device {
                 String::from_utf8_lossy(&out.stdout).into_owned()
             }
         }
+    }
+
+    /// Copy an image (PNG bytes) on this device.
+    pub fn copy_image(&self, png: &[u8]) {
+        match &self.clipboard {
+            Clipboard::File => {
+                let tmp = self.dir.join("clipboard.new");
+                fs::write(&tmp, png).unwrap();
+                fs::rename(tmp, self.dir.join("clipboard")).unwrap();
+            }
+            Clipboard::Wayland { socket } => {
+                let mut child = Command::new("wl-copy")
+                    .args(["--type", "image/png"])
+                    .env("WAYLAND_DISPLAY", socket)
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                std::io::Write::write_all(&mut child.stdin.take().unwrap(), png).unwrap();
+                child.wait().unwrap();
+            }
+            Clipboard::X11 { .. } => panic!("no X11 app here can copy images"),
+        }
+    }
+
+    /// The image pasting on this device would give, if it's an image.
+    pub fn image(&self) -> Option<Vec<u8>> {
+        let bytes = match &self.clipboard {
+            Clipboard::File => fs::read(self.dir.join("clipboard")).ok()?,
+            Clipboard::Wayland { socket } => {
+                let out = Command::new("wl-paste")
+                    .args(["-n", "-t", "image/png"])
+                    .env("WAYLAND_DISPLAY", socket)
+                    .output()
+                    .ok()?;
+                out.status.success().then_some(out.stdout)?
+            }
+            Clipboard::X11 { .. } => panic!("no X11 app here can paste images"),
+        };
+        bytes.starts_with(b"\x89PNG").then_some(bytes)
+    }
+
+    pub fn wait_for_image(&self, png: &[u8]) {
+        eventually(&format!("{} to have the {}-byte image", self.name, png.len()), || {
+            self.image().as_deref() == Some(png)
+        });
     }
 
     /// Empty the clipboard, as restarting the app that held it does on X11.

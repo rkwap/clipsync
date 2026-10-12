@@ -5,7 +5,10 @@
 //! and hands it to whoever asks. To read, we ask the owner to convert the
 //! CLIPBOARD selection into a property on our (invisible) window. To write,
 //! we become the owner and answer other apps' requests ourselves. Large
-//! text moves in chunks both ways (the ICCCM "INCR" protocol).
+//! transfers move in chunks both ways (the ICCCM "INCR" protocol).
+//!
+//! Reading starts by asking the owner which formats it offers (TARGETS):
+//! text if there's any, otherwise a PNG image.
 
 use std::error::Error;
 use std::io;
@@ -23,12 +26,13 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NONE};
 
+use super::{Content, is_png};
 use crate::lock;
-use crate::net::MAX_TEXT;
+use crate::net::MAX_CONTENT;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-/// Text larger than this is sent to other apps in chunks of this size.
+/// Anything larger than this is sent to other apps in chunks of this size.
 /// Many apps refuse to read one huge property.
 const CHUNK: usize = 256 * 1024;
 
@@ -43,6 +47,7 @@ x11rb::atom_manager! {
         TEXT,
         INCR,
         TEXT_PLAIN: b"text/plain;charset=utf-8",
+        IMAGE_PNG: b"image/png",
         CLIPSYNC: b"CLIPSYNC_DATA",
     }
 }
@@ -51,8 +56,8 @@ struct X11 {
     conn: RustConnection,
     win: Window,
     atoms: Atoms,
-    /// The UTF-8 text we serve to other apps while we own the clipboard.
-    owned: Mutex<Option<Arc<[u8]>>>,
+    /// What we serve to other apps while we own the clipboard.
+    owned: Mutex<Option<Content>>,
 }
 
 static X: OnceLock<X11> = OnceLock::new();
@@ -65,6 +70,8 @@ fn x() -> &'static X11 {
 /// of the clipboard's contents at startup.
 enum Read {
     Idle,
+    /// Asked the owner which formats it offers.
+    Targets(bool),
     /// Asked the owner for `target`, waiting for its SelectionNotify.
     Waiting(Atom, bool),
     /// Large transfer, arriving in chunks.
@@ -118,13 +125,13 @@ fn try_connect() -> Result<()> {
     Ok(())
 }
 
-pub fn set(text: &str) -> io::Result<()> {
-    try_set(text).map_err(io::Error::other)
+pub fn set(content: &Content) -> io::Result<()> {
+    try_set(content).map_err(io::Error::other)
 }
 
-fn try_set(text: &str) -> Result<()> {
+fn try_set(content: &Content) -> Result<()> {
     let x = x();
-    *lock(&x.owned) = Some(text.as_bytes().into());
+    *lock(&x.owned) = Some(content.clone());
     x.conn.set_selection_owner(x.win, x.atoms.CLIPBOARD, CURRENT_TIME)?;
     let owner = x.conn.get_selection_owner(x.atoms.CLIPBOARD)?.reply()?.owner;
     if owner != x.win {
@@ -133,34 +140,52 @@ fn try_set(text: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn watch(mut on_change: impl FnMut(String, bool)) -> io::Result<()> {
+pub fn watch(mut on_change: impl FnMut(Content, bool)) -> io::Result<()> {
     try_watch(&mut on_change).map_err(|e| io::Error::other(format!("X11: {e}")))
 }
 
-fn try_watch(on_change: &mut dyn FnMut(String, bool)) -> Result<()> {
+/// Nothing usable on the clipboard (only reported for the startup read).
+fn nothing(initial: bool, on_change: &mut dyn FnMut(Content, bool)) {
+    if initial {
+        on_change(Content::Text("".into()), true);
+    }
+}
+
+fn try_watch(on_change: &mut dyn FnMut(Content, bool)) -> Result<()> {
     let x = x();
     let a = &x.atoms;
     // Start with what's on the clipboard now.
-    let mut read = x.request(a.UTF8_STRING, true)?;
+    let mut read = x.request(a.TARGETS, Read::Targets(true))?;
     let mut sends: Vec<Outgoing> = Vec::new();
     loop {
         match x.conn.wait_for_event()? {
             Event::XfixesSelectionNotify(e) if e.selection == a.CLIPBOARD => {
                 // Skip our own writes, and the clipboard being emptied.
                 if e.owner != x.win && e.owner != NONE {
-                    read = x.request(a.UTF8_STRING, false)?;
+                    read = x.request(a.TARGETS, Read::Targets(false))?;
                 }
             }
             Event::SelectionNotify(e) if e.requestor == x.win && e.selection == a.CLIPBOARD => {
                 read = match read {
+                    // Very old apps don't answer TARGETS; just ask for text.
+                    Read::Targets(initial) if e.property == NONE => x.request(a.UTF8_STRING, Read::Waiting(a.UTF8_STRING, initial))?,
+                    Read::Targets(initial) => {
+                        let offered: Vec<Atom> = x.take_property()?.value32().map(Iterator::collect).unwrap_or_default();
+                        match x.pick(&offered) {
+                            Some(target) => x.request(target, Read::Waiting(target, initial))?,
+                            None => {
+                                nothing(initial, on_change);
+                                Read::Idle
+                            }
+                        }
+                    }
                     // The owner can't provide UTF-8; very old apps may still offer Latin-1.
                     Read::Waiting(target, initial) if e.property == NONE => {
                         if target == a.UTF8_STRING {
-                            x.request(AtomEnum::STRING.into(), initial)?
+                            let string = AtomEnum::STRING.into();
+                            x.request(string, Read::Waiting(string, initial))?
                         } else {
-                            if initial {
-                                on_change(String::new(), true); // no text on the clipboard
-                            }
+                            nothing(initial, on_change);
                             Read::Idle
                         }
                     }
@@ -171,7 +196,7 @@ fn try_watch(on_change: &mut dyn FnMut(String, bool)) -> Result<()> {
                             // the owner to start sending chunks.
                             Read::Incr(target, Vec::new(), initial)
                         } else {
-                            deliver(target, reply.value, initial, on_change);
+                            x.deliver(target, reply.value, initial, on_change);
                             Read::Idle
                         }
                     }
@@ -192,12 +217,12 @@ fn try_watch(on_change: &mut dyn FnMut(String, bool)) -> Result<()> {
                 let chunk = x.take_property()?.value;
                 if chunk.is_empty() {
                     // A zero-length chunk ends the transfer.
-                    deliver(target, buf, initial, on_change);
-                } else if buf.len() + chunk.len() <= MAX_TEXT {
+                    x.deliver(target, buf, initial, on_change);
+                } else if buf.len() + chunk.len() <= MAX_CONTENT {
                     buf.extend_from_slice(&chunk);
                     read = Read::Incr(target, buf, initial);
                 } else {
-                    log!("ignoring clipboard larger than {} MB", MAX_TEXT >> 20);
+                    log!("not syncing a copy larger than {} MB", MAX_CONTENT >> 20);
                 }
             }
             // An app we're sending to in chunks consumed the last one.
@@ -217,22 +242,35 @@ fn try_watch(on_change: &mut dyn FnMut(String, bool)) -> Result<()> {
     }
 }
 
-fn deliver(target: Atom, bytes: Vec<u8>, initial: bool, on_change: &mut dyn FnMut(String, bool)) {
-    let text = if target == Atom::from(AtomEnum::STRING) {
-        bytes.iter().map(|&b| char::from(b)).collect() // Latin-1
-    } else {
-        String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
-    };
-    if initial || !text.is_empty() {
-        on_change(text, initial);
-    }
-}
-
 impl X11 {
-    fn request(&self, target: Atom, initial: bool) -> Result<Read> {
+    /// Ask the owner to convert the clipboard to `target`; `next` is what we're then waiting for.
+    fn request(&self, target: Atom, next: Read) -> Result<Read> {
         self.conn.convert_selection(self.win, self.atoms.CLIPBOARD, target, self.atoms.CLIPSYNC, CURRENT_TIME)?;
         self.conn.flush()?;
-        Ok(Read::Waiting(target, initial))
+        Ok(next)
+    }
+
+    /// The format to read, from those the owner offers: text first, then PNG.
+    fn pick(&self, offered: &[Atom]) -> Option<Atom> {
+        let a = &self.atoms;
+        [a.UTF8_STRING, a.TEXT_PLAIN, AtomEnum::STRING.into(), a.IMAGE_PNG].into_iter().find(|t| offered.contains(t))
+    }
+
+    fn deliver(&self, target: Atom, bytes: Vec<u8>, initial: bool, on_change: &mut dyn FnMut(Content, bool)) {
+        let content = if target == self.atoms.IMAGE_PNG {
+            if !is_png(&bytes) {
+                return nothing(initial, on_change);
+            }
+            Content::Image(bytes.into())
+        } else if target == Atom::from(AtomEnum::STRING) {
+            Content::Text(bytes.iter().map(|&b| char::from(b)).collect::<String>().into()) // Latin-1
+        } else {
+            let text = String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            Content::Text(text.into())
+        };
+        if initial || !content.is_empty() {
+            on_change(content, initial);
+        }
     }
 
     /// Read and delete our transfer property.
@@ -252,23 +290,26 @@ impl X11 {
         let string = Atom::from(AtomEnum::STRING);
         let owned = lock(&self.owned).clone().filter(|_| e.selection == a.CLIPBOARD);
 
-        let data = match owned {
+        let data: Option<(Atom, Arc<[u8]>)> = match owned {
             None => None,
-            Some(_) if e.target == a.TARGETS => {
-                let targets = [a.TARGETS, a.UTF8_STRING, a.TEXT_PLAIN, a.TEXT, string];
-                self.conn.change_property32(PropMode::REPLACE, e.requestor, property, AtomEnum::ATOM, &targets)?;
+            Some(content) if e.target == a.TARGETS => {
+                let targets: &[Atom] = match content {
+                    Content::Text(_) => &[a.TARGETS, a.UTF8_STRING, a.TEXT_PLAIN, a.TEXT, string],
+                    Content::Image(_) => &[a.TARGETS, a.IMAGE_PNG],
+                };
+                self.conn.change_property32(PropMode::REPLACE, e.requestor, property, AtomEnum::ATOM, targets)?;
                 self.notify(&e, property)?;
                 return Ok(());
             }
-            Some(text) if [a.UTF8_STRING, a.TEXT_PLAIN, a.TEXT].contains(&e.target) => {
+            Some(Content::Text(text)) if [a.UTF8_STRING, a.TEXT_PLAIN, a.TEXT].contains(&e.target) => {
                 let ty = if e.target == a.TEXT { a.UTF8_STRING } else { e.target };
-                Some((ty, text))
+                Some((ty, text.as_bytes().into()))
             }
-            Some(text) if e.target == string => {
-                let latin1: Vec<u8> =
-                    String::from_utf8_lossy(&text).chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect();
+            Some(Content::Text(text)) if e.target == string => {
+                let latin1: Vec<u8> = text.chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect();
                 Some((string, latin1.into()))
             }
+            Some(Content::Image(png)) if e.target == a.IMAGE_PNG => Some((a.IMAGE_PNG, png)),
             Some(_) => None,
         };
         let Some((ty, data)) = data else {

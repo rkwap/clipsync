@@ -13,7 +13,8 @@
 //! `u16 length || ciphertext`. Messages:
 //!
 //! - HELLO   `u16 listen port || latest event id`; always first
-//! - EVENT   `event id || UTF-8 text`: a copy
+//! - EVENT   `event id || UTF-8 text`: a copy of text
+//! - IMAGE   `event id || PNG`: a copy of an image (0.1.0 ignores these)
 //! - MEMBERS the member list (see cluster.rs)
 //! - WANT / NOPE `event id`: ask for a missed copy / don't have its text
 //! - ADDRS   `device key (hex) address` lines: where the sender reaches other
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use snow::StatelessTransportState;
 
+use crate::clip::{Content, is_png};
 use crate::cluster::Membership;
 use crate::hub::{Event, Hello, Hub, Out, now_ms};
 use crate::store::{DeviceId, EventId};
@@ -41,7 +43,8 @@ pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// each other. Versions with the same protocol work together.
 pub const PROTOCOL: u8 = 1;
 const MAGIC: &[u8; 8] = b"clipsync";
-pub const MAX_TEXT: usize = 16 << 20;
+/// The largest copy synced, text or image.
+pub const MAX_CONTENT: usize = 50 << 20;
 const MAX_CHUNK: usize = 65535 - 16;
 const PING_EVERY: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(15);
@@ -59,6 +62,7 @@ const MEMBERS: u8 = 3;
 const WANT: u8 = 4;
 const NOPE: u8 = 5;
 const ADDRS: u8 = 6;
+const IMAGE: u8 = 7;
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -109,7 +113,7 @@ fn recv_msg(r: &TcpStream, c: &mut Cipher) -> io::Result<(u8, Vec<u8>)> {
         return Err(invalid("short message"));
     }
     let total = u32::from_be_bytes(first[..4].try_into().unwrap()) as usize;
-    if total > MAX_TEXT + 64 {
+    if total > MAX_CONTENT + 64 {
         return Err(invalid("message too large"));
     }
     let mut plain = first[4..].to_vec();
@@ -441,8 +445,17 @@ fn write_loop(
         match rx.recv_timeout(PING_EVERY) {
             Ok(Out::Event(ev)) => {
                 let mut p = event_id_bytes(&ev.id);
-                p.extend_from_slice(ev.text.as_bytes());
-                send_msg(stream, c, EVENT, &p)?;
+                let kind = match &ev.content {
+                    Content::Text(text) => {
+                        p.extend_from_slice(text.as_bytes());
+                        EVENT
+                    }
+                    Content::Image(png) => {
+                        p.extend_from_slice(png);
+                        IMAGE
+                    }
+                };
+                send_msg(stream, c, kind, &p)?;
             }
             Ok(Out::Members(text)) => send_msg(stream, c, MEMBERS, text.as_bytes())?,
             Ok(Out::MembersThenClose(text)) => {
@@ -470,8 +483,17 @@ fn read_loop(stream: &TcpStream, c: &mut Cipher, hub: &Arc<Hub>, conn: u64, last
             EVENT => {
                 let Some(id) = event_id(&payload) else { continue };
                 match String::from_utf8(payload[40..].to_vec()) {
-                    Ok(text) => hub.receive_event(conn, Event { id, text: text.into() }),
+                    Ok(text) => hub.receive_event(conn, Event { id, content: Content::Text(text.into()) }),
                     Err(_) => log!("ignoring non-UTF-8 text from peer"),
+                }
+            }
+            IMAGE => {
+                let Some(id) = event_id(&payload) else { continue };
+                let png = &payload[40..];
+                if is_png(png) {
+                    hub.receive_event(conn, Event { id, content: Content::Image(png.into()) });
+                } else {
+                    log!("ignoring an image from a peer that isn't a PNG");
                 }
             }
             MEMBERS => hub.merge_members(&payload),

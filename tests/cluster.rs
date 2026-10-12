@@ -135,12 +135,12 @@ fn restarts_dont_resend_and_a_lost_clipboard_is_restored() {
     devices[1].wait_for_clipboard("before the restart");
 
     // A plain restart: nothing is sent or applied again.
-    let (sent, received) = (devices[1].log_count("bytes to"), devices[0].log_count("received"));
+    let (sent, received) = (devices[1].log_count("] sent "), devices[0].log_count("received"));
     devices[1].stop();
     devices[1].start();
     wait_connected(&[&devices[0], &devices[1]]);
     thread::sleep(Duration::from_secs(1));
-    assert_eq!(devices[1].log_count("bytes to"), sent);
+    assert_eq!(devices[1].log_count("] sent "), sent);
     assert_eq!(devices[0].log_count("received"), received);
 
     // On X11 a restart empties the clipboard clipsync was holding; it comes back.

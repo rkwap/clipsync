@@ -21,7 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cluster::{self, Cluster, Membership};
 use crate::store::{DeviceId, EventId, Identity, PeerState, State, hex, unhex32};
-use crate::{clip, lock, net};
+use crate::clip::{self, Content};
+use crate::net::{self, MAX_CONTENT};
+use crate::lock;
 
 /// A connection that hasn't received anything (not even a ping) for this long
 /// is presumed dead, and a new connection to the same peer replaces it.
@@ -34,7 +36,7 @@ pub fn now_ms() -> u64 {
 /// A copy, as sent between devices.
 pub struct Event {
     pub id: EventId,
-    pub text: Arc<str>,
+    pub content: Content,
 }
 
 /// What a connection's writer sends.
@@ -79,8 +81,8 @@ struct Latest {
     id: EventId,
     hash: [u8; 32],
     /// Kept in memory only, to hand to peers that missed it. Unknown after a
-    /// restart until the clipboard watcher reports the same text again.
-    text: Option<Arc<str>>,
+    /// restart until the clipboard watcher reports the same content again.
+    content: Option<Content>,
 }
 
 struct Events {
@@ -144,12 +146,12 @@ impl Hub {
         let mut events = Events { hlc: state.hlc, latest: None, pending: None, restore: false };
         let mut saved = BTreeMap::new();
         if state.cluster == Some(cluster.id) {
-            events.latest = state.latest.map(|(id, hash)| Latest { id, hash, text: None });
+            events.latest = state.latest.map(|(id, hash)| Latest { id, hash, content: None });
             saved = state.peers;
         } else {
             // New to this cluster: copies made before now aren't "missed".
             let id = EventId { hlc: events.tick(), origin: [0; 32] };
-            events.latest = Some(Latest { id, hash: [0; 32], text: None });
+            events.latest = Some(Latest { id, hash: [0; 32], content: None });
         }
         Hub {
             id: me.public,
@@ -503,32 +505,35 @@ impl Hub {
     }
 
     /// The local clipboard changed. `initial` is its contents at startup
-    /// (empty if there's no text), which isn't a new copy.
-    pub fn local_change(&self, text: String, initial: bool) {
-        let hash = *blake3::hash(text.as_bytes()).as_bytes();
+    /// (empty if there's nothing usable), which isn't a new copy.
+    pub fn local_change(&self, content: Content, initial: bool) {
+        if content.len() > MAX_CONTENT {
+            log!("not syncing {}: the limit is {} MB", content.describe(), MAX_CONTENT >> 20);
+            return;
+        }
+        let hash = content.hash();
         let event = {
             let mut ev = lock(&self.events);
             let same = ev.latest.as_ref().is_some_and(|l| l.hash == hash);
             if initial {
                 if same && let Some(l) = ev.latest.as_mut() {
-                    // Our newest copy: keep its text to serve peers that missed it.
-                    l.text = Some(text.into());
-                } else if text.is_empty() && ev.latest.as_ref().is_some_and(|l| l.id.origin != [0; 32]) {
+                    // Our newest copy: keep it to serve peers that missed it.
+                    l.content = Some(content);
+                } else if content.is_empty() && ev.latest.as_ref().is_some_and(|l| l.id.origin != [0; 32]) {
                     ev.restore = true;
                     drop(ev);
                     self.maybe_catch_up();
                 }
                 return;
             }
-            if text.is_empty() || same {
+            if content.is_empty() || same {
                 return;
             }
             ev.restore = false;
             let id = EventId { hlc: ev.tick(), origin: self.id };
-            let text: Arc<str> = text.into();
-            ev.latest = Some(Latest { id, hash, text: Some(text.clone()) });
+            ev.latest = Some(Latest { id, hash, content: Some(content.clone()) });
             ev.pending = None;
-            Arc::new(Event { id, text })
+            Arc::new(Event { id, content })
         };
         self.save_state();
         let peers = lock(&self.peers);
@@ -536,14 +541,14 @@ impl Hub {
             let _ = p.tx.send(Out::Event(event.clone()));
         }
         if !peers.is_empty() {
-            log!("sent {} bytes to {} device(s)", event.text.len(), peers.len());
+            log!("sent {} to {} device(s)", event.content.describe(), peers.len());
         }
     }
 
     /// A peer sent a copy: put it on our clipboard if it's newer than ours.
     /// Older ones are concurrent copies that lost, or ones we already have.
     pub fn receive_event(&self, conn: u64, event: Event) {
-        let hash = *blake3::hash(event.text.as_bytes()).as_bytes();
+        let hash = event.content.hash();
         let applied = {
             let mut ev = lock(&self.events);
             ev.hlc = ev.hlc.max(event.id.hlc);
@@ -555,11 +560,11 @@ impl Hub {
                 // when it notices our own write, and doesn't send it back.
                 let same = !restoring && ev.latest.as_ref().is_some_and(|l| l.hash == hash);
                 ev.restore = false;
-                if !same && let Err(e) = clip::set(&event.text) {
+                if !same && let Err(e) = clip::set(&event.content) {
                     log!("failed to set clipboard: {e}");
                     return;
                 }
-                ev.latest = Some(Latest { id: event.id, hash, text: Some(event.text.clone()) });
+                ev.latest = Some(Latest { id: event.id, hash, content: Some(event.content.clone()) });
                 if ev.pending.as_ref().is_some_and(|p| p.target <= event.id) {
                     ev.pending = None;
                 }
@@ -572,9 +577,9 @@ impl Hub {
         if let Some((changed, restored)) = applied {
             self.save_state();
             if restored {
-                log!("restored the last copy ({} bytes), lost while clipsync was stopped", event.text.len());
+                log!("restored the last copy ({}), lost while clipsync was stopped", event.content.describe());
             } else if changed {
-                log!("received {} bytes, copied on {}", event.text.len(), self.name_of(&event.id.origin));
+                log!("received {}, copied on {}", event.content.describe(), self.name_of(&event.id.origin));
             }
         }
         self.maybe_catch_up();
@@ -583,20 +588,20 @@ impl Hub {
     /// A peer that missed a copy asks for it.
     pub fn want(&self, conn: u64, target: EventId) {
         let reply = match &lock(&self.events).latest {
-            Some(l) if l.id >= target && l.text.is_some() => {
-                Out::Event(Arc::new(Event { id: l.id, text: l.text.clone().unwrap() }))
+            Some(l) if l.id >= target && l.content.is_some() => {
+                Out::Event(Arc::new(Event { id: l.id, content: l.content.clone().unwrap() }))
             }
             _ => Out::Nope(target),
         };
         if let Out::Event(e) = &reply
             && let Some(p) = lock(&self.peers).iter().find(|p| p.conn == conn)
         {
-            log!("sent {} a copy it missed ({} bytes)", p.label, e.text.len());
+            log!("sent {} a copy it missed ({})", p.label, e.content.describe());
         }
         self.send_to(conn, reply);
     }
 
-    /// The peer we asked doesn't have the text (e.g. it restarted since).
+    /// The peer we asked doesn't have the content (e.g. it restarted since).
     pub fn nope(&self, conn: u64, target: EventId) {
         if let Some(p) = lock(&self.events).pending.as_mut().filter(|p| p.target == target && p.conn == Some(conn)) {
             p.conn = None;
