@@ -19,7 +19,7 @@ unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/clipsync.service"
 alive() { [ -f "$s/pid" ] && kill -0 "$(cat "$s/pid")" 2>/dev/null; }
 launch() {
     exe=$(sed -n 's/^ExecStart="\(.*\)"$/\1/p' "$unit")
-    setsid sh -c 'echo $$ > "$1/pid"; exec "$2" >> "$1/log" 2>&1 < /dev/null' sh "$s" "$exe" &
+    sh -c 'echo $$ > "$1/pid"; exec "$2" >> "$1/log" 2>&1' sh "$s" "$exe" > /dev/null 2>&1 < /dev/null &
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -f "$s/pid" ] && break; sleep 0.1; done
 }
 halt() { if alive; then kill "$(cat "$s/pid")"; fi; rm -f "$s/pid"; }
@@ -44,7 +44,7 @@ state=$(cat "$s/state" 2>/dev/null || echo none)
 alive() { [ -f "$s/pid" ] && kill -0 "$(cat "$s/pid")" 2>/dev/null; }
 launch() {
     exe=$(sed -n 's|.*<array><string>\(.*\)</string></array>.*|\1|p' "$plist")
-    setsid sh -c 'echo $$ > "$1/pid"; exec "$2" >> "$1/log" 2>&1 < /dev/null' sh "$s" "$exe" &
+    sh -c 'echo $$ > "$1/pid"; exec "$2" >> "$1/log" 2>&1' sh "$s" "$exe" > /dev/null 2>&1 < /dev/null &
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -f "$s/pid" ] && break; sleep 0.1; done
 }
 linger() { n=$(cat "$s/left"); if [ "$n" -le 1 ]; then echo none > "$s/state"; else echo $((n - 1)) > "$s/left"; fi; }

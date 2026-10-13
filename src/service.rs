@@ -128,9 +128,9 @@ fn in_background(m: Manager, pid: u32) -> bool {
         Manager::Systemd => succeeds(systemctl(&["is-active", "--quiet", UNIT])),
         Manager::Launchd => launchctl(&["print", &agent().1])
             .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&format!("pid = {pid}"))),
-        // Detached processes have no controlling terminal (field 7 of /proc/<pid>/stat).
-        Manager::Detached => fs::read_to_string(format!("/proc/{pid}/stat"))
-            .is_ok_and(|s| s.rsplit(')').next().and_then(|rest| rest.split_whitespace().nth(4)) == Some("0")),
+        // Detached processes have no terminal: `ps` shows "?" on Linux, "??" on macOS.
+        Manager::Detached => run("ps", &["-o", "tty=", "-p", &pid.to_string()])
+            .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().starts_with('?')),
     }
 }
 
