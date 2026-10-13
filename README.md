@@ -155,14 +155,30 @@ A removed device is cut off right away by every device that knows about the
 removal; devices that were offline learn about it the next time they connect.
 A removed device can be invited again later.
 
-**The background service:**
+### Running in the background
 
-| | Linux (systemd) | macOS (launchd) |
+The installer starts clipsync in the background, and it starts again whenever
+you log in. To manage that:
+
+```sh
+clipsync status     # is it running? does it start at login? how many devices are connected?
+clipsync start      # start it in the background (again), now and at every login
+clipsync stop       # stop it, and don't start it at login until `clipsync start`
+```
+
+If you quit it by accident, `clipsync start` brings it back. Running plain
+`clipsync` in a terminal is different: that copy runs only until you press
+Ctrl-C or close the terminal (`clipsync status` tells you which kind is
+running).
+
+In the background, clipsync is a systemd user service on Linux and a launchd
+agent on macOS. On Linux without systemd, `clipsync start` runs it as a
+detached process, which doesn't start again at login: add `clipsync start` to
+your desktop's autostart. Its log:
+
+| Linux (systemd) | macOS | Linux without systemd |
 |---|---|---|
-| Logs | `journalctl --user -u clipsync -f` | `tail -f ~/Library/Logs/clipsync.log` |
-| Restart | `systemctl --user restart clipsync` | `launchctl kickstart -k gui/$(id -u)/com.clipsync` |
-| Stop | `systemctl --user stop clipsync` | `launchctl bootout gui/$(id -u)/com.clipsync` |
-| Status | `systemctl --user status clipsync` | `launchctl print gui/$(id -u)/com.clipsync` |
+| `journalctl --user -u clipsync -f` | `tail -f ~/Library/Logs/clipsync.log` | `~/.config/clipsync/clipsync.log` |
 
 ## Updating
 
@@ -243,6 +259,11 @@ network. Use the `--at` address that `invite` printed:
 - On macOS, check **System Settings → Privacy & Security → Local Network** and
   allow clipsync.
 
+**clipsync isn't running in the background** (check with `clipsync status`):
+run `clipsync start`. On macOS, updating from 0.2.0 or earlier could leave it
+stopped (fixed in 0.2.1); those versions don't have `clipsync start` yet, so run
+the install command again instead, which updates it and starts it.
+
 **Linux: the service can't reach the clipboard** ("no usable clipboard" in
 the log). The service needs your session's display. Most desktops pass it to
 systemd automatically; if yours doesn't, add this to your session's startup:
@@ -278,7 +299,9 @@ The end-to-end tests in [`tests/cluster.rs`](tests/cluster.rs) and
 sync text and images, remove and restart each other. They don't need a display
 or a network: each test device uses a plain file as its clipboard (a file
 starting with the PNG signature is an image), and mDNS is off. They run in
-about 20 seconds.
+about 20 seconds. [`tests/service.rs`](tests/service.rs) checks `clipsync
+start`, `stop` and `status` against stand-ins for systemd and launchd that
+really start and stop clipsync.
 
 The system tests in [`tests/system.rs`](tests/system.rs) exercise the real
 backends, and skip themselves if what they need is missing:
@@ -299,6 +322,7 @@ Environment variables, mainly for testing:
 | `CLIPSYNC_CLIPBOARD_FILE` | use this file as the clipboard instead of the system one |
 | `CLIPSYNC_RELEASES` | where to look for releases (default: this repository's GitHub releases) |
 | `CLIPSYNC_NO_UPDATE_CHECK` | don't check for new releases |
+| `CLIPSYNC_SERVICE_MANAGER` | `systemd`, `launchd` or `none`: how `clipsync start` runs it, instead of detecting that |
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs clippy and
 the tests on Linux and macOS for every push and pull request, plus the X11

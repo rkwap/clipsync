@@ -27,7 +27,6 @@ ACTION=install
 
 UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/clipsync.service"
 PLIST="$HOME/Library/LaunchAgents/com.clipsync.plist"
-LOG="$HOME/Library/Logs/clipsync.log"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -50,6 +49,8 @@ case "$OS" in
 esac
 
 # ---- the background service ----
+# `clipsync start` sets it up (a systemd user service on Linux, a launchd
+# agent on macOS); this only cleans up when uninstalling.
 
 have_systemd() {
     command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
@@ -59,56 +60,9 @@ service_installed() {
     if [ "$OS" = Linux ]; then [ -f "$UNIT" ]; else [ -f "$PLIST" ]; fi
 }
 
-start_service() {
-    if [ "$OS" = Linux ]; then
-        mkdir -p "$(dirname "$UNIT")"
-        cat > "$UNIT" <<UNIT
-# clipsync's systemd user service, written by its installer.
-#
-# Wanted by default.target rather than graphical-session.target, which many
-# desktops (XFCE, labwc, sway without extra setup) never start. If the session
-# hasn't passed its display to systemd yet, clipsync exits and is retried.
-
-[Unit]
-Description=clipsync: share copies between your devices
-After=graphical-session.target
-
-[Service]
-ExecStart=$BIN
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-UNIT
-        systemctl --user daemon-reload
-        systemctl --user enable clipsync.service >/dev/null 2>&1
-        systemctl --user restart clipsync.service
-    else
-        mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
-        cat > "$PLIST" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!-- clipsync's launchd agent, written by its installer. -->
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.clipsync</string>
-  <key>ProgramArguments</key>
-  <array><string>$BIN</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$LOG</string>
-  <key>StandardErrorPath</key><string>$LOG</string>
-</dict>
-</plist>
-PLIST
-        launchctl bootout "gui/$(id -u)/com.clipsync" 2>/dev/null || true
-        launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    fi
-}
-
 stop_service() {
+    if [ -x "$BIN" ]; then "$BIN" stop >/dev/null 2>&1 || true; fi
+    # Versions before 0.2.1 have no `clipsync stop`.
     if [ "$OS" = Linux ]; then
         if [ -f "$UNIT" ] && have_systemd; then
             systemctl --user disable --now clipsync.service >/dev/null 2>&1 || true
@@ -215,7 +169,7 @@ INSTALLED="$("$BIN" --version | cut -d' ' -f2)"
 
 if [ -n "$PREVIOUS" ]; then
     # An update: keep the existing setup.
-    if [ "$SERVICE" = yes ] && service_installed; then start_service; fi
+    if [ "$SERVICE" = yes ] && service_installed; then "$BIN" start >/dev/null; fi
     if [ "$PREVIOUS" = "$INSTALLED" ]; then
         say "clipsync $INSTALLED was already installed; reinstalled it."
     else
@@ -237,23 +191,16 @@ if [ "$OS" = Linux ] && [ -n "${WAYLAND_DISPLAY:-}" ] && ! command -v wl-paste >
 fi
 
 if [ "$SERVICE" = yes ]; then
-    if [ "$OS" = Linux ] && ! have_systemd; then
-        say "No systemd user session here; start \`$BIN\` from your desktop's autostart instead."
-    else
-        start_service
-        say "clipsync is running in the background, and starts whenever you log in."
-        if [ "$OS" = Linux ]; then
-            say "    logs:  journalctl --user -u clipsync -f"
-            if ! systemctl --user show-environment | grep -qE '^(WAYLAND_)?DISPLAY='; then
-                say "Note: your session hasn't given systemd its display, so clipsync can't reach"
-                say "the clipboard. Add this to your session's startup:"
-                say "    systemctl --user import-environment DISPLAY WAYLAND_DISPLAY"
-            fi
-        else
-            say "    logs:  tail -f $LOG"
-            say "macOS may ask to let clipsync find devices on your local network: allow it."
-        fi
+    "$BIN" start
+    if [ "$OS" = Linux ] && have_systemd && ! systemctl --user show-environment | grep -qE '^(WAYLAND_)?DISPLAY='; then
+        say "Note: your session hasn't given systemd its display, so clipsync can't reach"
+        say "the clipboard. Add this to your session's startup:"
+        say "    systemctl --user import-environment DISPLAY WAYLAND_DISPLAY"
     fi
+    if [ "$OS" = Darwin ]; then
+        say "macOS may ask to let clipsync find devices on your local network: allow it."
+    fi
+    say "Run \`clipsync status\` any time to check on it."
 fi
 
 say ""

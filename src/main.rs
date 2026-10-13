@@ -8,11 +8,12 @@ mod discovery;
 mod hub;
 mod net;
 mod pair;
+mod service;
 mod store;
 mod update;
 
 use std::ffi::CStr;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -31,12 +32,15 @@ const USAGE: &str = "\
 clipsync - share copies between your devices on the same network
 
 USAGE:
-    clipsync [run] [OPTIONS]        sync with the other devices in this device's cluster
+    clipsync [run] [OPTIONS]        run in this terminal (`clipsync start` for the background)
     clipsync invite                 add a device: shows a one-time code
     clipsync join CODE [--at ADDR]  join the cluster of the device that showed CODE
     clipsync devices                list the devices in this cluster
     clipsync remove DEVICE          remove a device (by name, or the start of its id)
     clipsync leave                  take this device out of its cluster
+    clipsync start                  run clipsync in the background, now and at login
+    clipsync stop                   stop it (and don't start it at login)
+    clipsync status                 whether it's running, and the cluster at a glance
     clipsync update [--check]       install the latest version (or just check for one)
 
 OPTIONS for run:
@@ -134,6 +138,9 @@ enum Cmd {
     Remove(String),
     Leave,
     Update { check: bool },
+    Start,
+    Stop,
+    Status,
 }
 
 fn parse_args() -> Result<Cmd, String> {
@@ -185,6 +192,9 @@ fn parse_args() -> Result<Cmd, String> {
         "remove" => Cmd::Remove(one("a device name or id")?),
         "leave" => none().map(|()| Cmd::Leave)?,
         "update" => none().map(|()| Cmd::Update { check })?,
+        "start" => none().map(|()| Cmd::Start)?,
+        "stop" => none().map(|()| Cmd::Stop)?,
+        "status" => none().map(|()| Cmd::Status)?,
         _ => return Err(format!("unknown command: {cmd}")),
     })
 }
@@ -194,6 +204,13 @@ fn main() {
         eprintln!("error: {e}\n\n{USAGE}");
         process::exit(2);
     });
+    // Commands that only print should end quietly when their output is cut
+    // short (`clipsync status | head -1`), like other Unix tools. Not the ones
+    // that use the network, where a closed connection must stay an error.
+    if !matches!(cmd, Cmd::Run(_) | Cmd::Invite | Cmd::Join { .. }) {
+        // SAFETY: restoring the default disposition before any threads start.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let result = match cmd {
         Cmd::Run(opts) => run(opts),
         Cmd::Invite => pair::invite(),
@@ -202,6 +219,9 @@ fn main() {
         Cmd::Remove(target) => remove(&target),
         Cmd::Leave => leave(),
         Cmd::Update { check } => update::update(check),
+        Cmd::Start => service::start(),
+        Cmd::Stop => service::stop(),
+        Cmd::Status => service::status(),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -215,9 +235,11 @@ fn modified(name: &str) -> Option<(SystemTime, u64)> {
 }
 
 fn run(opts: RunOpts) -> io::Result<()> {
-    let Some(_running) = store::try_lock(store::DAEMON_LOCK)? else {
+    let Some(mut running) = store::try_lock(store::DAEMON_LOCK)? else {
         return Err(io::Error::other("clipsync is already running on this device"));
     };
+    running.set_len(0)?;
+    write!(running, "{}", process::id())?;
     let me = store::identity()?;
     let cluster = match cluster::load()? {
         Some(c) if c.is_member(&me.public) => c,

@@ -76,11 +76,20 @@ pub fn try_lock(name: &str) -> io::Result<Option<File>> {
     }
 }
 
-/// The daemon holds this lock for as long as it runs.
+/// The daemon holds this lock for as long as it runs, and writes its
+/// process id into it.
 pub const DAEMON_LOCK: &str = "daemon.lock";
 
 pub fn daemon_running() -> bool {
     matches!(try_lock(DAEMON_LOCK), Ok(None))
+}
+
+/// The running daemon's process id.
+pub fn daemon_pid() -> Option<u32> {
+    if !daemon_running() {
+        return None;
+    }
+    fs::read_to_string(path(DAEMON_LOCK)).ok()?.trim().parse().ok()
 }
 
 pub fn hex(bytes: &[u8]) -> String {
