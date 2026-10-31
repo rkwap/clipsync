@@ -177,6 +177,8 @@ pub struct PeerState {
     pub online: bool,
     /// The clipsync version it last said it runs.
     pub version: Option<String>,
+    /// Its Tailscale addresses, if it uses Tailscale.
+    pub tailnet: Vec<SocketAddr>,
 }
 
 /// The daemon's state, kept across restarts. Owned by the daemon; commands
@@ -222,11 +224,13 @@ impl State {
                 ["listen", port] => st.listen_port = port.parse().ok(),
                 ["peer", id, addr, seen, online, rest @ ..] => {
                     if let Some(id) = unhex32(id) {
+                        let tailnet = rest.get(1).map(|a| a.split(',').filter_map(|a| a.parse().ok()).collect());
                         let p = PeerState {
                             addr: addr.parse().ok(),
                             last_seen: seen.parse().unwrap_or(0),
                             online: *online == "1",
                             version: rest.first().filter(|v| **v != "-").map(|v| v.to_string()),
+                            tailnet: tailnet.unwrap_or_default(),
                         };
                         st.peers.insert(id, p);
                     }
@@ -253,7 +257,11 @@ impl State {
         for (id, p) in &self.peers {
             let addr = p.addr.map_or("-".to_string(), |a| a.to_string());
             let version = p.version.as_deref().unwrap_or("-");
-            s += &format!("peer {} {addr} {} {} {version}\n", hex(id), p.last_seen, p.online as u8);
+            s += &format!("peer {} {addr} {} {} {version}", hex(id), p.last_seen, p.online as u8);
+            if !p.tailnet.is_empty() {
+                s += &format!(" {}", p.tailnet.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
+            }
+            s += "\n";
         }
         if let Some(v) = &self.update {
             s += &format!("update {v}\n");
@@ -313,7 +321,13 @@ mod tests {
             peers: BTreeMap::new(),
             update: Some("0.2.0".into()),
         };
-        let p = PeerState { addr: "10.0.0.2:7878".parse().ok(), last_seen: 42, online: true, version: Some("0.1.0".into()) };
+        let p = PeerState {
+            addr: "10.0.0.2:7878".parse().ok(),
+            last_seen: 42,
+            online: true,
+            version: Some("0.1.0".into()),
+            tailnet: vec!["100.84.73.86:7878".parse().unwrap(), "[fd7a:115c:a1e0::1]:7878".parse().unwrap()],
+        };
         st.peers.insert([5; 32], p);
         st.peers.insert([6; 32], PeerState::default());
         let back = State::parse(&st.to_text());
@@ -321,6 +335,8 @@ mod tests {
         assert_eq!(back.latest, st.latest);
         assert_eq!(back.peers[&[5; 32]].addr, st.peers[&[5; 32]].addr);
         assert_eq!(back.peers[&[5; 32]].version.as_deref(), Some("0.1.0"));
+        assert_eq!(back.peers[&[5; 32]].tailnet, st.peers[&[5; 32]].tailnet);
+        assert!(back.peers[&[6; 32]].tailnet.is_empty());
         assert_eq!(back.update.as_deref(), Some("0.2.0"));
     }
 

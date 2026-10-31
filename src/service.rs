@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 use std::env;
 
-use crate::{cluster, store, update};
+use crate::{cluster, store, tailnet, update};
 
 const UNIT: &str = "clipsync.service";
 const LABEL: &str = "com.clipsync";
@@ -354,6 +354,12 @@ pub fn status() -> io::Result<()> {
             println!("In a cluster of {n} devices, {online} of the others connected. See `clipsync devices`.");
         }
         None => println!("Not paired with any device yet: run `clipsync invite`, or `clipsync join CODE`."),
+    }
+    match tailnet::Mode::load().map(|mode| (mode, tailnet::own_addrs())) {
+        Ok((tailnet::Mode::Off, _)) => {}
+        Ok((mode, addrs)) if addrs.is_empty() => println!("Tailscale: {mode}, but Tailscale isn't up on this device."),
+        Ok((mode, addrs)) => println!("Tailscale: {mode}, at {}.", tailnet::list(&addrs)),
+        Err(e) => println!("Tailscale: {e}"),
     }
     Ok(())
 }

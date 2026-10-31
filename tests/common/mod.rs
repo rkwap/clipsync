@@ -50,6 +50,8 @@ pub struct Device {
     pub bin: PathBuf,
     /// Use mDNS (off by default, so tests work without multicast).
     pub discovery: bool,
+    /// Stand-in Tailscale addresses (CLIPSYNC_TAILNET_ADDRS), e.g. "127.0.0.1".
+    pub tailnet: Option<String>,
     daemon: Option<Child>,
 }
 
@@ -78,7 +80,16 @@ impl Device {
         let dir = std::env::temp_dir().join(format!("clipsync-test-{}-{n}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        Device { name: name.into(), dir, port: free_port(), clipboard, bin: BIN.into(), discovery: false, daemon: None }
+        Device {
+            name: name.into(),
+            dir,
+            port: free_port(),
+            clipboard,
+            bin: BIN.into(),
+            discovery: false,
+            tailnet: None,
+            daemon: None,
+        }
     }
 
     /// A clipsync command run as this device.
@@ -87,6 +98,10 @@ impl Device {
         c.env("CLIPSYNC_DIR", self.dir.join("config")).env("CLIPSYNC_NAME", &self.name);
         c.env("CLIPSYNC_NO_UPDATE_CHECK", "1");
         c.env_remove("CLIPSYNC_CLIPBOARD_FILE").env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY");
+        match &self.tailnet {
+            Some(addrs) => c.env("CLIPSYNC_TAILNET_ADDRS", addrs),
+            None => c.env_remove("CLIPSYNC_TAILNET_ADDRS"),
+        };
         match &self.clipboard {
             Clipboard::File => c.env("CLIPSYNC_CLIPBOARD_FILE", self.dir.join("clipboard")),
             Clipboard::X11 { display, .. } => c.env("DISPLAY", display),

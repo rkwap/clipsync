@@ -19,6 +19,8 @@
 //! - WANT / NOPE `event id`: ask for a missed copy / don't have its text
 //! - ADDRS   `device key (hex) address` lines: where the sender reaches other
 //!   members, so devices can find each other without mDNS
+//! - TAILNET `address` lines: the sender's Tailscale addresses, if it uses
+//!   Tailscale (versions without Tailscale support ignore it)
 //! - PING    keepalive
 //!
 //! An event id is `u64 hybrid-logical-clock time || origin device key (32)`.
@@ -51,6 +53,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(15);
 /// While connected to a peer, how often its dialer checks whether it still is.
 const IDLE_CHECK: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long an address gets to answer before the next one is tried too.
+const NEXT_ADDR_AFTER: Duration = Duration::from_millis(300);
 /// How long the device whose connection would lose the tie-break waits
 /// before dialing, so both sides don't usually connect at once.
 const HEAD_START: Duration = Duration::from_secs(1);
@@ -63,6 +68,7 @@ const WANT: u8 = 4;
 const NOPE: u8 = 5;
 const ADDRS: u8 = 6;
 const IMAGE: u8 = 7;
+const TAILNET: u8 = 8;
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -138,8 +144,9 @@ fn event_id_bytes(id: &EventId) -> Vec<u8> {
     out
 }
 
-/// Bind `addr` and accept peers on a background thread. Returns the port.
-pub fn listen(addr: &str, hub: Arc<Hub>) -> io::Result<u16> {
+/// Bind `addr` and accept peers on a background thread. Returns the address
+/// bound (with the port picked, if `addr` left it to the system).
+pub fn listen(addr: &str, hub: Arc<Hub>) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     log!("listening on {local}");
@@ -167,7 +174,7 @@ pub fn listen(addr: &str, hub: Arc<Hub>) -> io::Result<u16> {
             });
         }
     });
-    Ok(local.port())
+    Ok(local)
 }
 
 /// Keep a connection to a member open, reconnecting with backoff. Stops once
@@ -262,15 +269,35 @@ fn connect(addrs: Vec<SocketAddr>, wake: &Receiver<()>) -> io::Result<Option<Tcp
     }
 }
 
+/// Connect to whichever of `addrs` answers first. They're tried in order,
+/// but each gets only NEXT_ADDR_AFTER before the next one is tried alongside
+/// it, so an address that no longer answers (which takes seconds to time
+/// out) doesn't hold up the rest.
 fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let (tx, rx) = mpsc::channel();
     let mut err = io::Error::new(io::ErrorKind::NotFound, "no address known");
-    for a in addrs {
-        match TcpStream::connect_timeout(a, Duration::from_secs(3)) {
-            Ok(s) => return Ok(s),
-            Err(e) => err = e,
+    let (mut started, mut pending) = (0, 0);
+    loop {
+        if let Some(&a) = addrs.get(started) {
+            let tx = tx.clone();
+            // Once we've returned, a late answer is dropped (closed) with the failed send.
+            thread::spawn(move || tx.send(TcpStream::connect_timeout(&a, CONNECT_TIMEOUT)));
+            started += 1;
+            pending += 1;
+        }
+        if pending == 0 {
+            return Err(err);
+        }
+        let wait = if started < addrs.len() { NEXT_ADDR_AFTER } else { CONNECT_TIMEOUT * 2 };
+        match rx.recv_timeout(wait) {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                err = e;
+                pending -= 1;
+            }
+            Err(_) => {} // still waiting: try the next address too
         }
     }
-    Err(err)
 }
 
 /// Run one connection until it drops. `dialed` says which side opened it;
@@ -465,6 +492,7 @@ fn write_loop(
             }
             Ok(Out::Want(id)) => send_msg(stream, c, WANT, &event_id_bytes(&id))?,
             Ok(Out::Nope(id)) => send_msg(stream, c, NOPE, &event_id_bytes(&id))?,
+            Ok(Out::Tailnet(text)) => send_msg(stream, c, TAILNET, text.as_bytes())?,
             Err(RecvTimeoutError::Timeout) => send_msg(stream, c, PING, &[])?,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -498,6 +526,7 @@ fn read_loop(stream: &TcpStream, c: &mut Cipher, hub: &Arc<Hub>, conn: u64, last
             }
             MEMBERS => hub.merge_members(&payload),
             ADDRS => hub.learn_addrs(&payload),
+            TAILNET => hub.learn_tailnet(conn, &payload),
             WANT => {
                 if let Some(id) = event_id(&payload) {
                     hub.want(conn, id);
@@ -567,6 +596,17 @@ mod tests {
         (&sa).write_all(&(n as u16).to_be_bytes()).unwrap();
         (&sa).write_all(&ct[..n]).unwrap();
         assert!(recv_msg(&sb, &mut cb).is_err());
+    }
+
+    #[test]
+    fn an_address_that_doesnt_answer_doesnt_hold_up_the_next() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        // TEST-NET-1: never answers (or fails right away, without a route).
+        let addrs = ["192.0.2.1:7878".parse().unwrap(), l.local_addr().unwrap()];
+        let started = Instant::now();
+        let stream = connect_any(&addrs).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), l.local_addr().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
     }
 
     #[test]

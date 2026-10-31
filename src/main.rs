@@ -10,6 +10,7 @@ mod net;
 mod pair;
 mod service;
 mod store;
+mod tailnet;
 mod update;
 
 use std::ffi::CStr;
@@ -27,6 +28,7 @@ use std::{env, fs, thread};
 
 use hub::Hub;
 use store::{DeviceId, hex};
+use tailnet::Mode;
 
 const USAGE: &str = "\
 clipsync - share copies between your devices on the same network
@@ -42,6 +44,7 @@ USAGE:
     clipsync stop                   stop it (and don't start it at login)
     clipsync status                 whether it's running, and the cluster at a glance
     clipsync update [--check]       install the latest version (or just check for one)
+    clipsync tailscale [MODE]       use Tailscale: on, only, or off (the default)
 
 OPTIONS for run:
     --listen ADDR    accept other devices on ADDR [default: 0.0.0.0:7878]
@@ -138,6 +141,7 @@ enum Cmd {
     Remove(String),
     Leave,
     Update { check: bool },
+    Tailscale(Option<String>),
     Start,
     Stop,
     Status,
@@ -192,6 +196,11 @@ fn parse_args() -> Result<Cmd, String> {
         "remove" => Cmd::Remove(one("a device name or id")?),
         "leave" => none().map(|()| Cmd::Leave)?,
         "update" => none().map(|()| Cmd::Update { check })?,
+        "tailscale" => match positional.as_slice() {
+            [] => Cmd::Tailscale(None),
+            [mode] => Cmd::Tailscale(Some(mode.clone())),
+            [_, extra, ..] => return Err(format!("unexpected argument: {extra}")),
+        },
         "start" => none().map(|()| Cmd::Start)?,
         "stop" => none().map(|()| Cmd::Stop)?,
         "status" => none().map(|()| Cmd::Status)?,
@@ -219,6 +228,7 @@ fn main() {
         Cmd::Remove(target) => remove(&target),
         Cmd::Leave => leave(),
         Cmd::Update { check } => update::update(check),
+        Cmd::Tailscale(mode) => tailscale(mode.as_deref()),
         Cmd::Start => service::start(),
         Cmd::Stop => service::stop(),
         Cmd::Status => service::status(),
@@ -270,16 +280,36 @@ fn run(opts: RunOpts) -> io::Result<()> {
     // Before networking starts, so the clipboard is ready when a device sends text.
     clip::init(opts.backend.as_deref())?;
     let others = cluster.active().count() - 1;
-    let hub = Arc::new(Hub::new(me, cluster, store::State::load()));
-    let port =
-        net::listen(&opts.listen, hub.clone()).map_err(|e| io::Error::new(e.kind(), format!("listening on {}: {e}", opts.listen)))?;
+    // Before reading the setting, so a change from here on restarts us.
+    let tailscale_stamp = modified(tailnet::FILE);
+    let tailscale = Mode::load()?;
+    let hub = Arc::new(Hub::new(me, cluster, store::State::load(), tailscale));
+    let listen = if tailscale == Mode::Only {
+        // Only on our Tailscale addresses, which tailnet::watch listens on as they appear.
+        let listen = opts.listen
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| io::Error::other(format!("--listen needs an IP:PORT, not {:?}", opts.listen)))?;
+        log!("Tailscale only: not using the local network");
+        if !listen.ip().is_unspecified() {
+            log!("listening on the Tailscale addresses instead of {}", listen.ip());
+        }
+        listen
+    } else {
+        let listening = net::listen(&opts.listen, hub.clone());
+        listening.map_err(|e| io::Error::new(e.kind(), format!("listening on {}: {e}", opts.listen)))?
+    };
+    let port = listen.port();
     hub.set_listen_port(port);
+    if tailscale != Mode::Off {
+        tailnet::watch(tailscale, listen, hub.clone());
+    }
     hub.sync_contacts();
     for (id, addr) in store::take_hints() {
         hub.hint(&id, addr);
     }
     log!("syncing with {others} other device(s) in this cluster");
     if opts.discovery
+        && tailscale != Mode::Only
         && let Err(e) = discovery::start(port, hub.clone())
     {
         log!("mDNS discovery unavailable ({e}); using last-known addresses only");
@@ -287,7 +317,7 @@ fn run(opts: RunOpts) -> io::Result<()> {
     if let Err(e) = on_shutdown(discovery::stop) {
         log!("can't handle signals ({e}); other devices will notice we left only on timeout");
     }
-    watch_files(hub.clone());
+    watch_files(hub.clone(), tailscale_stamp);
     if opts.update_check {
         update::watch(hub.clone());
     }
@@ -302,8 +332,10 @@ fn exe_stamp() -> Option<(u64, SystemTime)> {
     Some((m.ino(), m.modified().ok()?))
 }
 
-/// Pick up changes made by `invite`, `join`, `remove` and `leave`, and updates.
-fn watch_files(hub: Arc<Hub>) {
+/// Pick up changes made by `invite`, `join`, `remove`, `leave` and
+/// `tailscale` (from `tailscale`, the setting file's stamp when it was read),
+/// and updates.
+fn watch_files(hub: Arc<Hub>, tailscale: Option<(SystemTime, u64)>) {
     thread::spawn(move || {
         let identity = modified("identity");
         let mut cluster = modified("cluster");
@@ -312,6 +344,10 @@ fn watch_files(hub: Arc<Hub>) {
             thread::sleep(Duration::from_secs(2));
             if modified("identity") != identity {
                 restart(); // joined another cluster
+            }
+            if modified(tailnet::FILE) != tailscale {
+                log!("the Tailscale setting changed; restarting");
+                restart();
             }
             if exe.is_some() && exe_stamp().is_some_and(|now| Some(now) != exe) {
                 log!("clipsync was updated; restarting");
@@ -354,7 +390,9 @@ fn devices() -> io::Result<()> {
     println!("{n} {} in this cluster:\n", if n == 1 { "device" } else { "devices" });
     for (id, m) in c.active() {
         let p = state.peers.get(id).cloned().unwrap_or_default();
-        let at = p.addr.map(|a| format!(" ({})", a.ip())).unwrap_or_default();
+        // Over Tailscale if it's one of the Tailscale addresses the device announced.
+        let over = |ip| if p.tailnet.iter().any(|a| a.ip() == ip) { " over Tailscale" } else { "" };
+        let at = p.addr.map(|a| format!(" ({}{})", a.ip(), over(a.ip()))).unwrap_or_default();
         let mut status = if Some(*id) == me {
             "this device".to_string()
         } else if running && p.online {
@@ -376,6 +414,52 @@ fn devices() -> io::Result<()> {
     }
     if let Some(v) = state.update.filter(|v| update::newer(v, update::VERSION)) {
         println!("\nclipsync {v} is available (this is {}): run `clipsync update`.", update::VERSION);
+    }
+    Ok(())
+}
+
+/// `clipsync tailscale [on|only|off]`: show or change the setting.
+fn tailscale(mode: Option<&str>) -> io::Result<()> {
+    // Setting a mode also replaces a setting that can't be read.
+    let (old, mode) = match mode {
+        None => Mode::load().map(|m| (Some(m), m))?,
+        Some(m) => {
+            let unknown = || io::Error::other(format!("unknown mode {m:?}: use on, only or off"));
+            (Mode::load().ok(), Mode::parse(m).ok_or_else(unknown)?)
+        }
+    };
+    let changed = old != Some(mode);
+    if changed {
+        mode.save()?;
+    }
+    let addrs = tailnet::own_addrs();
+    match mode {
+        Mode::Off => {
+            println!("Tailscale: off. clipsync uses the local network only.");
+            println!("`clipsync tailscale on` also connects devices over Tailscale, from any network;");
+            println!("`clipsync tailscale only` connects them over Tailscale alone.");
+        }
+        Mode::On => {
+            println!("Tailscale: on. Devices also connect over Tailscale, so they stay connected on");
+            println!("different networks.");
+        }
+        Mode::Only => {
+            println!("Tailscale: only. clipsync connects over Tailscale alone, and doesn't announce this");
+            println!("device on the local network. To add a device, `clipsync invite` shows the address");
+            println!("for `clipsync join CODE --at ADDRESS`.");
+        }
+    }
+    if mode != Mode::Off {
+        if addrs.is_empty() {
+            println!("\nTailscale isn't up on this device. clipsync uses it once it is.");
+        } else {
+            println!("\nThis device's Tailscale address: {}", tailnet::list(&addrs));
+        }
+        println!("Turn it on (`on` or `only`) on the other devices too.");
+    }
+    // Until it's paired, clipsync isn't using the network yet; it reads the setting once it is.
+    if changed && store::daemon_running() && cluster::load().ok().flatten().is_some() {
+        println!("\nclipsync is restarting to use the new setting.");
     }
     Ok(())
 }

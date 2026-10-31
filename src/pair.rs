@@ -7,6 +7,9 @@
 //! eavesdropper could use to try codes offline: each guess costs a live
 //! attempt, and the invite closes after three wrong ones. Over that key the
 //! new device sends its public key and name, and receives the member list.
+//!
+//! With `clipsync tailscale only`, there's no mDNS: the invite listens on
+//! this device's Tailscale address only, and `join` needs `--at` with it.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
@@ -20,6 +23,7 @@ use spake2::{Ed25519Group, Identity as SpakeIdentity, Password, Spake2};
 
 use crate::cluster::{self, Cluster};
 use crate::store::{self, DeviceId, Identity, hex};
+use crate::tailnet::{self, Mode};
 
 const SERVICE: &str = "_clipsync-pair._tcp.local.";
 const MAGIC: &[u8; 8] = b"clippair";
@@ -119,22 +123,42 @@ pub fn invite() -> io::Result<()> {
         println!("Created a new cluster with this device ({name}) in it.\n");
     }
 
-    let listener = TcpListener::bind("0.0.0.0:0")?;
+    let tailscale = Mode::load()?;
+    let tailnet = tailnet::own_addrs();
+    let listener = match (tailscale, tailnet.first()) {
+        (Mode::Only, Some(ip)) => TcpListener::bind(SocketAddr::new(*ip, 0))?,
+        (Mode::Only, None) => {
+            return Err(io::Error::other(
+                "Tailscale isn't up on this device, and with `clipsync tailscale only` devices pair over it",
+            ));
+        }
+        _ => TcpListener::bind("0.0.0.0:0")?,
+    };
     let port = listener.local_addr()?.port();
     let [a, b, c, d] = store::random::<4>()?;
     let nameplate = 10 + a % 90;
     let code = format!("{nameplate}-{:06}", u32::from_be_bytes([0, b, c, d]) % 1_000_000);
 
     // Advertise the invite. Without mDNS, `join --at` still works.
-    let advertised = advertise(&name, nameplate, port);
-    if let Err(e) = &advertised {
+    let advertised = (tailscale != Mode::Only).then(|| advertise(&name, nameplate, port));
+    if let Some(Err(e)) = &advertised {
         println!("Can't advertise the invite on the network ({e}); the new device will need --at.\n");
     }
 
     println!("Invite code:  {code}   (valid for 10 minutes, for one device)\n");
-    println!("On the device you want to add, run:\n\n    clipsync join {code}\n");
-    let ip = local_ip().map_or("<this device's IP>".to_string(), |ip| ip.to_string());
-    println!("If it can't find this device, add:  --at {ip}:{port}\n");
+    if tailscale == Mode::Only {
+        println!("On the device you want to add, run:\n\n    clipsync join {code} --at {}\n", listener.local_addr()?);
+    } else {
+        println!("On the device you want to add, run:\n\n    clipsync join {code}\n");
+        let ip = local_ip().map_or("<this device's IP>".to_string(), |ip| ip.to_string());
+        println!("If it can't find this device, add:  --at {ip}:{port}");
+        if tailscale == Mode::On
+            && let Some(ip) = tailnet.first()
+        {
+            println!("Or, over Tailscale:                 --at {}", SocketAddr::new(*ip, port));
+        }
+        println!();
+    }
     if !store::daemon_running() {
         println!("Note: clipsync isn't running on this device; start it so the new device can sync.\n");
     }
@@ -171,7 +195,7 @@ pub fn invite() -> io::Result<()> {
             Err(e) => println!("Pairing with {} failed: {e}", from.ip()),
         }
     };
-    if let Ok((mdns, fullname)) = advertised {
+    if let Some(Ok((mdns, fullname))) = advertised {
         if let Ok(done) = mdns.unregister(&fullname) {
             let _ = done.recv_timeout(Duration::from_secs(1));
         }
@@ -237,6 +261,12 @@ pub fn join(code: &str, at: Option<&str>) -> io::Result<()> {
         return Err(invalid("a code looks like 37-482917"));
     }
     let code = code.trim();
+    let tailscale = Mode::load()?;
+    if tailscale == Mode::Only && at.is_none() {
+        return Err(io::Error::other(
+            "with `clipsync tailscale only`, add --at with the address `clipsync invite` showed",
+        ));
+    }
 
     // Try an inviting device at each of its addresses until one answers; then
     // never again, so a wrong code costs that invite one attempt, not one per
@@ -269,7 +299,16 @@ pub fn join(code: &str, at: Option<&str>) -> io::Result<()> {
     };
 
     let joined = if let Some(at) = at {
-        outcome(try_inviter(at, at.to_socket_addrs()?.collect()))
+        let mut addrs: Vec<SocketAddr> = at.to_socket_addrs()?.collect();
+        if tailscale == Mode::Only {
+            addrs.retain(|a| tailnet::is_tailnet(a.ip()));
+            if addrs.is_empty() {
+                return Err(io::Error::other(format!(
+                    "{at} isn't a Tailscale address, and with `clipsync tailscale only` devices pair over Tailscale"
+                )));
+            }
+        }
+        outcome(try_inviter(at, addrs))
     } else {
         println!("Looking for the device that showed this code...");
         let mdns = ServiceDaemon::new().map_err(io::Error::other)?;

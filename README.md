@@ -20,6 +20,7 @@ to 20.
 - [Install](#install)
 - [Pair your devices](#pair-your-devices)
 - [Everyday use](#everyday-use)
+- [Tailscale (optional)](#tailscale-optional)
 - [Updating](#updating)
 - [What gets synced](#what-gets-synced)
 - [Troubleshooting](#troubleshooting)
@@ -126,8 +127,9 @@ clipsync join 37-482917
 
 Both start syncing within a few seconds. Repeat for each device; **any device
 in the cluster can invite**. The two devices need to be on the same network
-while pairing. After that, devices of a cluster find each other on any
-network they share.
+while pairing (or on the same tailnet, with [Tailscale](#tailscale-optional)
+on). After that, devices of a cluster find each other on any network they
+share.
 
 A code works for one device, expires after 10 minutes, and the invite is
 cancelled after 3 wrong attempts, so it can't be guessed even on a busy network.
@@ -179,6 +181,57 @@ your desktop's autostart. Its log:
 | Linux (systemd) | macOS | Linux without systemd |
 |---|---|---|
 | `journalctl --user -u clipsync -f` | `tail -f ~/Library/Logs/clipsync.log` | `~/.config/clipsync/clipsync.log` |
+
+## Tailscale (optional)
+
+If your devices are on a [Tailscale](https://tailscale.com) network (a
+tailnet), clipsync can use it too, so they keep syncing on different networks:
+a desktop at home and a laptop at the office, or Wi-Fi that blocks traffic
+between devices. It's off unless you turn it on. On each device:
+
+```sh
+clipsync tailscale on      # also connect over Tailscale
+clipsync tailscale only    # connect over Tailscale alone
+clipsync tailscale off     # the default: the local network only
+clipsync tailscale         # show the setting and this device's Tailscale address
+```
+
+A running clipsync restarts to apply a change.
+
+- **`on`**: devices tell each other their Tailscale addresses and remember
+  them. On the same network they still find each other with mDNS; anywhere
+  else, they connect over Tailscale. `clipsync invite` also shows a Tailscale
+  address for `--at`, so a new device can join from another network.
+- **`only`**: clipsync uses Tailscale and nothing else. It accepts connections
+  only on this device's Tailscale address, connects to the other devices only
+  at theirs, and doesn't use mDNS. To pair, `clipsync invite` shows the
+  `clipsync join CODE --at ADDRESS` to run on the new device.
+
+Use `on` or `only` on every device: one with Tailscale off doesn't share its
+Tailscale address. Devices with `on` and `only` work together.
+
+**Is it more secure?** Copies are end-to-end encrypted between your devices
+either way (see [How it works](#how-it-works)), so running them through
+Tailscale doesn't make them any more secret. What `only` adds: nothing outside
+your tailnet can connect to clipsync, and clipsync stops announcing the device
+(its name and clipsync key) with mDNS on every network it joins, such as café
+Wi-Fi.
+
+Good to know:
+
+- Your tailnet's access controls must allow TCP port 7878 between the devices.
+  Tailscale's default policy does.
+- clipsync finds the device's Tailscale address on its network interfaces: the
+  `tailscale0` interface on Linux, or the interface with an address in
+  Tailscale's IPv6 range. It doesn't work with Tailscale's userspace
+  networking mode, which has no interface, or on a Mac whose tailnet has IPv6
+  turned off.
+- If Tailscale isn't up yet when clipsync starts, clipsync starts using it
+  within about 10 seconds of it coming up. While it's down, the other devices
+  keep this device's Tailscale address for when it's back.
+- If clipsync can't read the setting, it stops with an error instead of
+  falling back to the local network. `clipsync tailscale on` (or `only`, or
+  `off`) sets it again.
 
 ## Updating
 
@@ -245,7 +298,8 @@ clipsync is meant to be left running. Measured recovery times:
 
 **`join` can't find the inviting device.** Both devices must be on the same
 network. Use the `--at` address that `invite` printed:
-`clipsync join 37-482917 --at 192.168.1.20:40211`.
+`clipsync join 37-482917 --at 192.168.1.20:40211`. With Tailscale on, the
+Tailscale address it printed works from any network.
 
 **Devices are paired but don't connect.**
 
@@ -253,7 +307,11 @@ network. Use the `--at` address that `invite` printed:
   7878 to connect (change it with `clipsync run --listen 0.0.0.0:PORT`).
   While `invite` runs, it also listens on a random TCP port.
 - Some networks (guest Wi-Fi, hotels, many offices, phone hotspots with
-  "client isolation") block traffic between devices. clipsync can't work there.
+  "client isolation") block traffic between devices. clipsync can't work
+  there, unless the devices use [Tailscale](#tailscale-optional).
+- With Tailscale on: `clipsync status` should show a Tailscale address on
+  each device (if not, Tailscale isn't up there), each device needs `on` or
+  `only`, and your tailnet's access controls must allow TCP port 7878.
 - Networks that only block mDNS are fine once devices have met: each device
   remembers where it last reached the others and shares those addresses.
 - On macOS, check **System Settings → Privacy & Security → Local Network** and
@@ -294,9 +352,10 @@ cargo test                      # unit tests, and end-to-end tests with real pro
 cargo test -- --ignored         # also the system tests (see below)
 ```
 
-The end-to-end tests in [`tests/cluster.rs`](tests/cluster.rs) and
-[`tests/images.rs`](tests/images.rs) start real clipsync processes that pair,
-sync text and images, remove and restart each other. They don't need a display
+The end-to-end tests in [`tests/cluster.rs`](tests/cluster.rs),
+[`tests/images.rs`](tests/images.rs) and
+[`tests/tailscale.rs`](tests/tailscale.rs) start real clipsync processes that
+pair, sync text and images, remove and restart each other. They don't need a display
 or a network: each test device uses a plain file as its clipboard (a file
 starting with the PNG signature is an image), and mDNS is off. They run in
 about 20 seconds. [`tests/service.rs`](tests/service.rs) checks `clipsync
@@ -323,6 +382,7 @@ Environment variables, mainly for testing:
 | `CLIPSYNC_RELEASES` | where to look for releases (default: this repository's GitHub releases) |
 | `CLIPSYNC_NO_UPDATE_CHECK` | don't check for new releases |
 | `CLIPSYNC_SERVICE_MANAGER` | `systemd`, `launchd` or `none`: how `clipsync start` runs it, instead of detecting that |
+| `CLIPSYNC_TAILNET_ADDRS` | comma-separated stand-ins for this device's Tailscale addresses (and the only addresses taken for Tailscale's) |
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs clippy and
 the tests on Linux and macOS for every push and pull request, plus the X11
@@ -361,6 +421,7 @@ installer, and `clipsync update` finds the release through `releases/latest`.
 | `src/net.rs` | connections and the wire protocol |
 | `src/hub.rs` | copy events, catch-up, membership changes, dialing |
 | `src/discovery.rs` | mDNS |
+| `src/tailnet.rs` | Tailscale: the setting, this device's Tailscale addresses |
 | `src/update.rs` | `clipsync update` and the daily check for new releases |
 | `src/clip/` | clipboard backends: Wayland, X11, macOS, file |
 
@@ -377,8 +438,10 @@ installer, and `clipsync update` finds the release through `releases/latest`.
 - **Connections.** Noise XX (X25519, ChaCha20-Poly1305, BLAKE2s) with the
   device keys, with the cluster id mixed in, then a membership check. Every
   pair of devices keeps one connection: both dial, and if both connections
-  succeed, both keep the one dialed by the lower device id. Pings every 5 s;
-  a connection silent for 15 s is dead.
+  succeed, both keep the one dialed by the lower device id. A device's
+  addresses are tried in order, but one that hasn't answered within 0.3 s
+  gets the next one tried alongside it, and the first to answer wins.
+  Pings every 5 s; a connection silent for 15 s is dead.
 - **Copies.** A copy is an event: (hybrid logical clock, origin device,
   text or PNG image).
   The clock never runs backwards and always moves past anything the device has
@@ -390,6 +453,17 @@ installer, and `clipsync update` finds the release through `releases/latest`.
   again every 30 s (mDNS on its own backs off to once an hour), reacts to its
   own and other devices' address changes immediately, and remembers and shares
   where it last reached each device.
+- **Tailscale.** With it on, a device looks up its Tailscale addresses on its
+  network interfaces (no Tailscale API involved), every 10 s in case they
+  change, and sends the ones it listens on to each member it connects to.
+  Members save them apart from the address they last connected at, which
+  changes with every network, pass them on along with the addresses they
+  share, and try them after the addresses mDNS finds. A device with Tailscale
+  off sends an empty list, so the others forget its addresses; one whose
+  Tailscale is down sends nothing, so they keep them. With `only`, a device
+  listens on its Tailscale addresses alone, dials only Tailscale addresses,
+  and doesn't start mDNS. Older versions ignore the new message and the
+  marked addresses, so this needs no protocol change.
 - **Watching the clipboard.** On Linux, `wl-paste --watch` (Wayland) or the
   XFixes extension (X11) reports changes, so nothing runs while idle. macOS
   has no change notification, so clipsync checks the pasteboard's change

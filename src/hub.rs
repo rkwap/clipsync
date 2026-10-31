@@ -7,8 +7,8 @@
 //! When a device connects, it learns the newest event each peer has; if it
 //! missed one while away, it asks a single peer for it.
 //!
-//! Lock order: `events` before `peers`. `cluster` and `contacts` are never
-//! held while taking another lock.
+//! Lock order: `events` before `peers`, and `own_tailnet` before `peers`.
+//! `cluster` and `contacts` are never held while taking another lock.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -23,6 +23,7 @@ use crate::cluster::{self, Cluster, Membership};
 use crate::store::{DeviceId, EventId, Identity, PeerState, State, hex, unhex32};
 use crate::clip::{self, Content};
 use crate::net::{self, MAX_CONTENT};
+use crate::tailnet::{self, Mode};
 use crate::lock;
 
 /// A connection that hasn't received anything (not even a ping) for this long
@@ -47,6 +48,8 @@ pub enum Out {
     MembersThenClose(Arc<str>),
     Want(EventId),
     Nope(EventId),
+    /// Our Tailscale addresses, one per line.
+    Tailnet(Arc<str>),
 }
 
 /// What a peer said in its HELLO.
@@ -113,10 +116,12 @@ struct Pending {
     asked: Vec<u64>,
 }
 
-/// How to reach a member: where mDNS sees it, and where we last connected to it.
+/// How to reach a member: where mDNS sees it, its Tailscale addresses, and
+/// where we last connected to it.
 struct Contact {
     discovered: Vec<SocketAddr>,
     fullname: Option<String>,
+    tailnet: Vec<SocketAddr>,
     last_known: Option<SocketAddr>,
     last_seen: u64,
     version: Option<String>,
@@ -138,10 +143,15 @@ pub struct Hub {
     update: Mutex<Option<String>>,
     /// Serializes state saves, so the last one written is the newest.
     saving: Mutex<()>,
+    tailscale: Mode,
+    /// Our Tailscale addresses as sent to peers, one per line: empty with
+    /// Tailscale off, so peers forget them, and `None` while it's on but
+    /// hasn't been up since we started, so peers keep what they know.
+    own_tailnet: Mutex<Option<Arc<str>>>,
 }
 
 impl Hub {
-    pub fn new(me: Identity, cluster: Cluster, state: State) -> Hub {
+    pub fn new(me: Identity, cluster: Cluster, state: State, tailscale: Mode) -> Hub {
         let update = state.update.clone();
         let mut events = Events { hlc: state.hlc, latest: None, pending: None, restore: false };
         let mut saved = BTreeMap::new();
@@ -166,6 +176,8 @@ impl Hub {
             listen_port: AtomicU16::new(0),
             update: Mutex::new(update),
             saving: Mutex::new(()),
+            tailscale,
+            own_tailnet: Mutex::new((tailscale == Mode::Off).then(|| "".into())),
         }
     }
 
@@ -285,6 +297,7 @@ impl Hub {
             let contact = Contact {
                 discovered: Vec::new(),
                 fullname: None,
+                tailnet: s.tailnet,
                 last_known: s.addr,
                 last_seen: s.last_seen,
                 version: s.version,
@@ -296,12 +309,19 @@ impl Hub {
         }
     }
 
-    /// Where to try reaching a member, or `None` if it's no longer one.
+    /// Where to try reaching a member, in order, or `None` if it's no longer one.
     pub fn addrs_for(&self, id: &DeviceId) -> Option<Vec<SocketAddr>> {
         let contacts = lock(&self.contacts);
         let c = contacts.get(id)?;
-        let mut addrs = c.discovered.clone();
-        addrs.extend(c.last_known.filter(|a| !addrs.contains(a)));
+        // Where mDNS sees it now, then its Tailscale addresses, which work
+        // from anywhere, then wherever we last reached it.
+        let tailnet = if self.tailscale == Mode::Off { &[][..] } else { &c.tailnet[..] };
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        for a in c.discovered.iter().chain(tailnet).chain(&c.last_known) {
+            if !addrs.contains(a) && (self.tailscale != Mode::Only || tailnet::is_tailnet(a.ip())) {
+                addrs.push(*a);
+            }
+        }
         Some(addrs)
     }
 
@@ -342,25 +362,88 @@ impl Hub {
         }
     }
 
-    /// Where we last reached each member, to share with peers.
+    /// Where we last reached each member, and its Tailscale addresses, to
+    /// share with peers. Tailscale addresses are marked `tailscale`, which
+    /// versions without Tailscale support can't parse, so they skip them.
     pub fn known_addrs(&self) -> String {
-        let contacts = lock(&self.contacts);
-        contacts.iter().filter_map(|(id, c)| Some(format!("{} {}\n", hex(id), c.last_known?))).collect()
+        let mut text = String::new();
+        for (id, c) in lock(&self.contacts).iter() {
+            if let Some(a) = c.last_known {
+                text += &format!("{} {a}\n", hex(id));
+            }
+            for a in &c.tailnet {
+                text += &format!("{} {a} tailscale\n", hex(id));
+            }
+        }
+        text
     }
 
-    /// A peer shared where it reaches other members. Only used for members we
-    /// have no address for: that's what lets a third device find the others
-    /// when mDNS is blocked.
+    /// A peer shared where it reaches other members. Only used for what we
+    /// don't know: that's what lets a third device find the others when mDNS
+    /// is blocked, or that it never met directly.
     pub fn learn_addrs(&self, text: &[u8]) {
         let text = String::from_utf8_lossy(text);
         let mut contacts = lock(&self.contacts);
+        let mut gossiped: HashMap<DeviceId, Vec<SocketAddr>> = HashMap::new();
         for line in text.lines() {
-            let Some((id, addr)) = line.split_once(' ') else { continue };
-            let (Some(id), Ok(addr)) = (unhex32(id), addr.parse::<SocketAddr>()) else { continue };
+            let mut fields = line.split(' ');
+            let id = fields.next().and_then(unhex32);
+            let addr = fields.next().and_then(|a| a.parse::<SocketAddr>().ok());
+            let (Some(id), Some(addr)) = (id, addr) else { continue };
+            if fields.next() == Some("tailscale") {
+                if tailnet::is_tailnet(addr.ip()) {
+                    gossiped.entry(id).or_default().push(addr);
+                }
+                continue;
+            }
+            // In `only` mode we'd never dial it, and it would keep a Tailscale
+            // address from being learned here later.
+            if self.tailscale == Mode::Only && !tailnet::is_tailnet(addr.ip()) {
+                continue;
+            }
             if let Some(c) = contacts.get_mut(&id).filter(|c| c.last_known.is_none() && c.discovered.is_empty()) {
                 c.last_known = Some(addr);
                 let _ = c.wake.send(());
             }
+        }
+        // What a member told us itself wins over what others say about it.
+        for (id, addrs) in gossiped {
+            if let Some(c) = contacts.get_mut(&id).filter(|c| c.tailnet.is_empty()) {
+                c.tailnet = addrs;
+                let _ = c.wake.send(());
+            }
+        }
+    }
+
+    /// Our Tailscale addresses changed (or were found at startup): tell the
+    /// members, now and whenever they connect.
+    pub fn set_own_tailnet(&self, addrs: &[SocketAddr]) {
+        let text: Arc<str> = addrs.iter().map(|a| format!("{a}\n")).collect::<String>().into();
+        // Held while sending, so add_peer can't send a peer the old list after this one.
+        let mut own = lock(&self.own_tailnet);
+        *own = Some(text.clone());
+        for p in lock(&self.peers).iter() {
+            let _ = p.tx.send(Out::Tailnet(text.clone()));
+        }
+    }
+
+    /// A peer sent its Tailscale addresses; none if it doesn't use Tailscale.
+    pub fn learn_tailnet(&self, conn: u64, text: &[u8]) {
+        let Some(id) = lock(&self.peers).iter().find(|p| p.conn == conn).map(|p| p.id) else { return };
+        let addrs: Vec<SocketAddr> = String::from_utf8_lossy(text)
+            .lines()
+            .filter_map(|l| l.parse::<SocketAddr>().ok())
+            .filter(|a| tailnet::is_tailnet(a.ip()))
+            .collect();
+        let changed = match lock(&self.contacts).get_mut(&id) {
+            Some(c) if c.tailnet != addrs => {
+                c.tailnet = addrs;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.save_state();
         }
     }
 
@@ -433,6 +516,13 @@ impl Hub {
             peers.push(peer);
             (conn, replaced)
         };
+        // Only now that it's in `peers`, and under `own_tailnet`: a change made
+        // meanwhile reaches it after this, never before.
+        let own = lock(&self.own_tailnet);
+        if let Some(text) = own.as_ref() {
+            self.send_to(conn.0, Out::Tailnet(text.clone()));
+        }
+        drop(own);
         if let Some(c) = lock(&self.contacts).get_mut(&id) {
             c.last_known = Some(SocketAddr::new(addr, hello.listen_port));
             c.last_seen = now_ms();
@@ -654,6 +744,7 @@ impl Hub {
                 last_seen: c.last_seen,
                 online: online.contains(id),
                 version: c.version.clone(),
+                tailnet: c.tailnet.clone(),
             };
             peers.insert(*id, p);
         }
@@ -674,6 +765,66 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hub(tailscale: Mode) -> Hub {
+        let me = Identity { private: [1; 32], public: [1; 32] };
+        let cluster = Cluster::new(me.public, "me").unwrap();
+        Hub::new(me, cluster, State::default(), tailscale)
+    }
+
+    /// A member we know these addresses for, without a dialer.
+    fn add_contact(hub: &Hub, id: DeviceId, discovered: &[&str], tailnet: &[&str], last_known: Option<&str>) {
+        let addrs = |a: &[&str]| a.iter().map(|a| a.parse().unwrap()).collect();
+        let contact = Contact {
+            discovered: addrs(discovered),
+            fullname: None,
+            tailnet: addrs(tailnet),
+            last_known: last_known.map(|a| a.parse().unwrap()),
+            last_seen: 0,
+            version: None,
+            wake: mpsc::channel().0,
+        };
+        lock(&hub.contacts).insert(id, contact);
+    }
+
+    fn addrs(hub: &Hub, id: DeviceId) -> Vec<String> {
+        hub.addrs_for(&id).unwrap().iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn where_to_dial_depends_on_the_tailscale_setting() {
+        let (lan, ts, last) = ("192.168.1.20:7878", "100.84.73.86:7878", "10.0.0.5:7878");
+        for (mode, want) in [(Mode::Off, vec![lan, last]), (Mode::On, vec![lan, ts, last]), (Mode::Only, vec![ts])] {
+            let hub = hub(mode);
+            add_contact(&hub, [2; 32], &[lan], &[ts], Some(last));
+            assert_eq!(addrs(&hub, [2; 32]), want, "{mode}");
+        }
+    }
+
+    #[test]
+    fn tailscale_addresses_spread_by_gossip() {
+        let a = hub(Mode::On);
+        add_contact(&a, [2; 32], &[], &["100.64.0.2:7878"], Some("192.168.1.20:7878"));
+        add_contact(&a, [3; 32], &[], &["100.64.0.3:7878"], None);
+
+        // A device that never met them learns both kinds of address.
+        let b = hub(Mode::On);
+        add_contact(&b, [2; 32], &[], &[], None);
+        add_contact(&b, [3; 32], &[], &[], None);
+        b.learn_addrs(a.known_addrs().as_bytes());
+        assert_eq!(addrs(&b, [2; 32]), ["100.64.0.2:7878", "192.168.1.20:7878"]);
+        assert_eq!(addrs(&b, [3; 32]), ["100.64.0.3:7878"]);
+
+        // With `only`, the LAN address is skipped instead of taking the slot a
+        // Tailscale address could fill; and what a member said itself wins.
+        let c = hub(Mode::Only);
+        add_contact(&c, [2; 32], &[], &[], None);
+        add_contact(&c, [3; 32], &[], &["100.64.0.30:7878"], None);
+        c.learn_addrs(a.known_addrs().as_bytes());
+        assert_eq!(lock(&c.contacts)[&[2; 32]].last_known, None);
+        assert_eq!(addrs(&c, [2; 32]), ["100.64.0.2:7878"]);
+        assert_eq!(addrs(&c, [3; 32]), ["100.64.0.30:7878"]);
+    }
 
     #[test]
     fn clock_only_moves_forward() {
